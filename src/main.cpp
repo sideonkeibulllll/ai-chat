@@ -41,8 +41,8 @@
 #define BACKLIGHT_MIN 10
 
 #define WIFI_MAX_SCAN_RESULTS 6
-#define WIFI_MAX_SSID_LEN 20
-#define WIFI_MAX_PASS_LEN 32
+#define WIFI_MAX_SSID_LEN 32
+#define WIFI_MAX_PASS_LEN 64
 
 TFT_eSPI tft = TFT_eSPI();
 SPIClass touchSPI;
@@ -79,7 +79,6 @@ typedef enum {
 
 typedef enum {
     WIFI_MODE_IDLE = 0,
-    WIFI_MODE_SCANNING,
     WIFI_MODE_CONNECTING,
     WIFI_MODE_CONNECTED,
     WIFI_MODE_FAILED
@@ -96,6 +95,7 @@ static backlight_mode_t backlightMode = BACKLIGHT_MODE_MANUAL;
 static uint8_t backlightLevel = BACKLIGHT_MAX;
 static volatile bool bootButtonPressed = false;
 static uint32_t lastActivityMs = 0;
+static uint32_t bootButtonDebounceMs = 0;
 
 static lv_obj_t* sidebar = nullptr;
 static lv_obj_t* toggleBtn = nullptr;
@@ -118,6 +118,7 @@ static lv_obj_t* wifiList = nullptr;
 static lv_obj_t* wifiStatusLabel = nullptr;
 static lv_obj_t* wifiPasswordOverlay = nullptr;
 static lv_obj_t* wifiTextarea = nullptr;
+static lv_obj_t* wifiKeyboard = nullptr;
 static lv_obj_t* wifiBtnScan = nullptr;
 
 static lv_obj_t* settingsPerfLabel = nullptr;
@@ -173,7 +174,7 @@ void bsp_touch_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {
 
 void bsp_backlight_set(uint8_t level) {
     ledcWrite(0, level);
-    backlightLevel = level;
+    Serial.printf("[BL] Set backlight: %d\n", level);
 }
 
 void rgbLedSet(uint8_t r, uint8_t g, uint8_t b) {
@@ -189,6 +190,33 @@ void rgbLedOff() {
 }
 
 void updateSettingsUI();
+
+void setBacklightMode(backlight_mode_t mode) {
+    backlightMode = mode;
+    
+    switch (mode) {
+        case BACKLIGHT_MODE_MANUAL:
+            bsp_backlight_set(backlightLevel > 0 ? backlightLevel : BACKLIGHT_MAX);
+            break;
+        case BACKLIGHT_MODE_AUTO:
+            {
+                uint16_t ldr = analogRead(LDR_PIN);
+                uint8_t level = map(constrain(ldr, 100, 4000), 100, 4000, BACKLIGHT_MIN, BACKLIGHT_MAX);
+                backlightLevel = level;
+                bsp_backlight_set(level);
+            }
+            break;
+        case BACKLIGHT_MODE_OFF:
+            bsp_backlight_set(0);
+            break;
+    }
+    
+    updateSettingsUI();
+    
+    Serial.printf("[Power] Backlight: %s (%d)\n",
+        mode == BACKLIGHT_MODE_MANUAL ? "MANUAL" :
+        mode == BACKLIGHT_MODE_AUTO ? "AUTO" : "OFF", backlightLevel);
+}
 
 void cycleBacklightMode() {
     backlight_mode_t newMode;
@@ -206,33 +234,26 @@ void cycleBacklightMode() {
             break;
     }
     
-    backlightMode = newMode;
-    
-    switch (newMode) {
-        case BACKLIGHT_MODE_MANUAL:
-            bsp_backlight_set(backlightLevel > 0 ? backlightLevel : BACKLIGHT_MAX);
-            break;
-        case BACKLIGHT_MODE_AUTO:
-            {
-                uint16_t ldr = analogRead(LDR_PIN);
-                uint8_t level = map(constrain(ldr, 100, 4000), 100, 4000, BACKLIGHT_MIN, BACKLIGHT_MAX);
-                bsp_backlight_set(level);
-            }
-            break;
-        case BACKLIGHT_MODE_OFF:
-            bsp_backlight_set(0);
-            break;
-    }
-    
-    updateSettingsUI();
-    
-    Serial.printf("[Power] Backlight: %s (%d)\n",
-        newMode == BACKLIGHT_MODE_MANUAL ? "MANUAL" :
-        newMode == BACKLIGHT_MODE_AUTO ? "AUTO" : "OFF", backlightLevel);
+    setBacklightMode(newMode);
 }
 
 void IRAM_ATTR bootButtonISR() {
     bootButtonPressed = true;
+}
+
+void handleBootButton() {
+    if (bootButtonPressed) {
+        bootButtonPressed = false;
+        
+        uint32_t now = millis();
+        if (now - bootButtonDebounceMs < 500) {
+            return;
+        }
+        bootButtonDebounceMs = now;
+        
+        cycleBacklightMode();
+        lastActivityMs = millis();
+    }
 }
 
 void lvglTaskEntry(void* arg) {
@@ -365,9 +386,14 @@ void closeCurrentApp() {
         lv_obj_del(appScreen);
         appScreen = nullptr;
     }
+    if (wifiPasswordOverlay) {
+        wifiPasswordOverlay = nullptr;
+    }
+    if (wifiKeyboard) {
+        wifiKeyboard = nullptr;
+    }
     wifiList = nullptr;
     wifiStatusLabel = nullptr;
-    wifiPasswordOverlay = nullptr;
     wifiTextarea = nullptr;
     wifiBtnScan = nullptr;
     fileList = nullptr;
@@ -385,8 +411,6 @@ void updateSettingsUI() {
     if (settingsPerfLabel) {
         lv_mem_monitor_t mem_mon;
         lv_mem_monitor(&mem_mon);
-        const char* modeStr = backlightMode == BACKLIGHT_MODE_MANUAL ? "M" :
-                              backlightMode == BACKLIGHT_MODE_AUTO ? "A" : "O";
         lv_label_set_text_fmt(settingsPerfLabel, 
             "CPU: %dMHz\nHeap: %uKB\nLVGL: %u%%",
             getCpuFrequencyMhz(), ESP.getFreeHeap() / 1024, mem_mon.used_pct);
@@ -398,7 +422,7 @@ void updateSettingsUI() {
         lv_label_set_text_fmt(settingsBacklightLabel, "Backlight: %d [%s]", backlightLevel, modeStr);
     }
     
-    if (settingsBacklightSlider) {
+    if (settingsBacklightSlider && backlightMode == BACKLIGHT_MODE_MANUAL) {
         lv_slider_set_value(settingsBacklightSlider, backlightLevel, LV_ANIM_OFF);
     }
     
@@ -413,8 +437,8 @@ void settings_backlight_slider_cb(lv_event_t *e) {
     lv_obj_t* slider = (lv_obj_t*)lv_event_get_target(e);
     int value = lv_slider_get_value(slider);
     backlightLevel = (uint8_t)value;
-    bsp_backlight_set(backlightLevel);
     backlightMode = BACKLIGHT_MODE_MANUAL;
+    bsp_backlight_set(backlightLevel);
     updateSettingsUI();
 }
 
@@ -426,12 +450,12 @@ void settings_back_cb(lv_event_t *e) {
     closeCurrentApp();
 }
 
-void wifi_back_cb(lv_event_t *e);
 void wifi_connect_cb(lv_event_t *e);
 void wifi_cancel_cb(lv_event_t *e);
 void wifi_item_cb(lv_event_t *e);
 void doWiFiScan();
 void wifi_rescan_cb(lv_event_t *e);
+void tryAutoConnectWiFi();
 
 void settings_app_cb(lv_event_t *e) {
     if (currentApp != APP_NONE) {
@@ -466,16 +490,16 @@ void settings_app_cb(lv_event_t *e) {
     lv_label_set_text(blTitle, "--- Backlight ---");
     lv_obj_set_style_text_color(blTitle, lv_color_make(0xFF, 0xFF, 0x00), 0);
     lv_obj_set_style_text_font(blTitle, &lv_font_montserrat_12, 0);
-    lv_obj_align(blTitle, LV_ALIGN_TOP_LEFT, 10, 100);
+    lv_obj_align(blTitle, LV_ALIGN_TOP_LEFT, 10, 90);
     
     settingsBacklightLabel = lv_label_create(appScreen);
     lv_obj_set_style_text_color(settingsBacklightLabel, lv_color_make(0x00, 0xFF, 0x00), 0);
     lv_obj_set_style_text_font(settingsBacklightLabel, &lv_font_montserrat_12, 0);
-    lv_obj_align(settingsBacklightLabel, LV_ALIGN_TOP_LEFT, 10, 120);
+    lv_obj_align(settingsBacklightLabel, LV_ALIGN_TOP_LEFT, 10, 110);
     
     settingsBacklightSlider = lv_slider_create(appScreen);
     lv_obj_set_width(settingsBacklightSlider, 200);
-    lv_obj_align(settingsBacklightSlider, LV_ALIGN_TOP_LEFT, 10, 145);
+    lv_obj_align(settingsBacklightSlider, LV_ALIGN_TOP_LEFT, 10, 135);
     lv_slider_set_range(settingsBacklightSlider, 0, 255);
     lv_slider_set_value(settingsBacklightSlider, backlightLevel, LV_ANIM_OFF);
     lv_obj_add_event_cb(settingsBacklightSlider, settings_backlight_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
@@ -483,11 +507,11 @@ void settings_app_cb(lv_event_t *e) {
     settingsModeLabel = lv_label_create(appScreen);
     lv_obj_set_style_text_color(settingsModeLabel, lv_color_make(0x00, 0xFF, 0x00), 0);
     lv_obj_set_style_text_font(settingsModeLabel, &lv_font_montserrat_12, 0);
-    lv_obj_align(settingsModeLabel, LV_ALIGN_TOP_LEFT, 10, 175);
+    lv_obj_align(settingsModeLabel, LV_ALIGN_TOP_LEFT, 10, 160);
     
     lv_obj_t* btnMode = lv_btn_create(appScreen);
-    lv_obj_set_size(btnMode, 100, 30);
-    lv_obj_align(btnMode, LV_ALIGN_TOP_LEFT, 10, 200);
+    lv_obj_set_size(btnMode, 100, 25);
+    lv_obj_align(btnMode, LV_ALIGN_TOP_LEFT, 10, 180);
     lv_obj_add_event_cb(btnMode, settings_mode_btn_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_set_style_bg_color(btnMode, lv_color_make(0x40, 0x40, 0x80), 0);
     lv_obj_t* lblMode = lv_label_create(btnMode);
@@ -498,7 +522,7 @@ void settings_app_cb(lv_event_t *e) {
     lv_label_set_text(wifiTitle, "--- WiFi ---");
     lv_obj_set_style_text_color(wifiTitle, lv_color_make(0xFF, 0xFF, 0x00), 0);
     lv_obj_set_style_text_font(wifiTitle, &lv_font_montserrat_12, 0);
-    lv_obj_align(wifiTitle, LV_ALIGN_TOP_LEFT, 10, 240);
+    lv_obj_align(wifiTitle, LV_ALIGN_TOP_LEFT, 10, 215);
     
     wifiStatusLabel = lv_label_create(appScreen);
     if (WiFi.status() == WL_CONNECTED) {
@@ -509,11 +533,11 @@ void settings_app_cb(lv_event_t *e) {
         lv_obj_set_style_text_color(wifiStatusLabel, lv_color_make(0xFF, 0xFF, 0x00), 0);
     }
     lv_obj_set_style_text_font(wifiStatusLabel, &lv_font_montserrat_12, 0);
-    lv_obj_align(wifiStatusLabel, LV_ALIGN_TOP_LEFT, 10, 260);
+    lv_obj_align(wifiStatusLabel, LV_ALIGN_TOP_LEFT, 10, 235);
     
     wifiBtnScan = lv_btn_create(appScreen);
-    lv_obj_set_size(wifiBtnScan, 80, 30);
-    lv_obj_align(wifiBtnScan, LV_ALIGN_TOP_LEFT, 10, 285);
+    lv_obj_set_size(wifiBtnScan, 80, 25);
+    lv_obj_align(wifiBtnScan, LV_ALIGN_TOP_LEFT, 10, 255);
     lv_obj_add_event_cb(wifiBtnScan, wifi_rescan_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_set_style_bg_color(wifiBtnScan, lv_color_make(0x00, 0x60, 0x80), 0);
     lv_obj_t* lblScan = lv_label_create(wifiBtnScan);
@@ -521,12 +545,12 @@ void settings_app_cb(lv_event_t *e) {
     lv_obj_center(lblScan);
     
     wifiList = lv_list_create(appScreen);
-    lv_obj_set_size(wifiList, SCREEN_WIDTH - 20, 80);
-    lv_obj_align(wifiList, LV_ALIGN_TOP_MID, 0, 320);
+    lv_obj_set_size(wifiList, SCREEN_WIDTH - 20, 60);
+    lv_obj_align(wifiList, LV_ALIGN_TOP_MID, 0, 285);
     lv_obj_set_style_bg_color(wifiList, lv_color_make(0x20, 0x20, 0x20), 0);
     
     lv_obj_t* btnBack = lv_btn_create(appScreen);
-    lv_obj_set_size(btnBack, 80, 30);
+    lv_obj_set_size(btnBack, 80, 25);
     lv_obj_align(btnBack, LV_ALIGN_BOTTOM_LEFT, 10, -5);
     lv_obj_add_event_cb(btnBack, settings_back_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_set_style_bg_color(btnBack, lv_color_make(0x40, 0x40, 0x80), 0);
@@ -535,14 +559,30 @@ void settings_app_cb(lv_event_t *e) {
     lv_obj_center(lblBack);
     
     updateSettingsUI();
+    
+    if (WiFi.status() != WL_CONNECTED) {
+        tryAutoConnectWiFi();
+    }
 }
 
-void wifi_back_cb(lv_event_t *e) {
-    if (wifiAppState == WIFI_MODE_CONNECTING) {
-        WiFi.disconnect();
-        wifiConnecting = false;
+void tryAutoConnectWiFi() {
+    const char* autoSSID = "YIYAN_cat";
+    const char* autoPass = "27276868999";
+    
+    if (wifiStatusLabel) {
+        lv_label_set_text(wifiStatusLabel, "Auto-connecting...");
     }
-    closeCurrentApp();
+    
+    Serial.printf("[WiFi] Auto-connecting to %s...\n", autoSSID);
+    
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(autoSSID, autoPass);
+    
+    wifiAppState = WIFI_MODE_CONNECTING;
+    wifiConnecting = true;
+    wifiConnectAttempts = 0;
+    strncpy(selectedSSID, autoSSID, WIFI_MAX_SSID_LEN - 1);
+    strncpy(wifiPassword, autoPass, WIFI_MAX_PASS_LEN - 1);
 }
 
 void wifi_connect_cb(lv_event_t *e) {
@@ -555,8 +595,11 @@ void wifi_connect_cb(lv_event_t *e) {
     if (wifiPasswordOverlay) {
         lv_obj_del(wifiPasswordOverlay);
         wifiPasswordOverlay = nullptr;
-        wifiTextarea = nullptr;
     }
+    if (wifiKeyboard) {
+        wifiKeyboard = nullptr;
+    }
+    wifiTextarea = nullptr;
     
     if (wifiStatusLabel) {
         lv_label_set_text(wifiStatusLabel, "Connecting...");
@@ -572,8 +615,11 @@ void wifi_cancel_cb(lv_event_t *e) {
     if (wifiPasswordOverlay) {
         lv_obj_del(wifiPasswordOverlay);
         wifiPasswordOverlay = nullptr;
-        wifiTextarea = nullptr;
     }
+    if (wifiKeyboard) {
+        wifiKeyboard = nullptr;
+    }
+    wifiTextarea = nullptr;
 }
 
 void wifi_item_cb(lv_event_t *e) {
@@ -592,10 +638,12 @@ void wifi_item_cb(lv_event_t *e) {
             WiFi.mode(WIFI_STA);
             WiFi.begin(selectedSSID, nullptr);
         } else {
-            wifiPasswordOverlay = lv_obj_create(appScreen);
-            lv_obj_set_size(wifiPasswordOverlay, SCREEN_WIDTH - 20, 130);
+            wifiPasswordOverlay = lv_obj_create(lv_layer_top());
+            lv_obj_set_size(wifiPasswordOverlay, SCREEN_WIDTH - 20, 180);
             lv_obj_align(wifiPasswordOverlay, LV_ALIGN_CENTER, 0, 0);
             lv_obj_set_style_bg_color(wifiPasswordOverlay, lv_color_make(0x30, 0x30, 0x50), 0);
+            lv_obj_set_style_border_width(wifiPasswordOverlay, 2, 0);
+            lv_obj_set_style_border_color(wifiPasswordOverlay, lv_color_make(0x00, 0xFF, 0x00), 0);
             lv_obj_move_foreground(wifiPasswordOverlay);
             
             lv_obj_t* label = lv_label_create(wifiPasswordOverlay);
@@ -610,9 +658,15 @@ void wifi_item_cb(lv_event_t *e) {
             lv_textarea_set_max_length(wifiTextarea, WIFI_MAX_PASS_LEN);
             lv_textarea_set_placeholder_text(wifiTextarea, "Enter password...");
             
+            wifiKeyboard = lv_keyboard_create(wifiPasswordOverlay);
+            lv_obj_set_size(wifiKeyboard, SCREEN_WIDTH - 30, 80);
+            lv_obj_align(wifiKeyboard, LV_ALIGN_TOP_MID, 0, 60);
+            lv_keyboard_set_textarea(wifiKeyboard, wifiTextarea);
+            lv_keyboard_set_mode(wifiKeyboard, LV_KEYBOARD_MODE_TEXT_LOWER);
+            
             lv_obj_t* btnConnect = lv_btn_create(wifiPasswordOverlay);
             lv_obj_set_size(btnConnect, 70, 25);
-            lv_obj_align(btnConnect, LV_ALIGN_BOTTOM_LEFT, 10, -10);
+            lv_obj_align(btnConnect, LV_ALIGN_BOTTOM_LEFT, 10, -5);
             lv_obj_add_event_cb(btnConnect, wifi_connect_cb, LV_EVENT_CLICKED, NULL);
             lv_obj_set_style_bg_color(btnConnect, lv_color_make(0x00, 0x80, 0x00), 0);
             lv_obj_t* lblConn = lv_label_create(btnConnect);
@@ -621,7 +675,7 @@ void wifi_item_cb(lv_event_t *e) {
             
             lv_obj_t* btnCancel = lv_btn_create(wifiPasswordOverlay);
             lv_obj_set_size(btnCancel, 70, 25);
-            lv_obj_align(btnCancel, LV_ALIGN_BOTTOM_RIGHT, -10, -10);
+            lv_obj_align(btnCancel, LV_ALIGN_BOTTOM_RIGHT, -10, -5);
             lv_obj_add_event_cb(btnCancel, wifi_cancel_cb, LV_EVENT_CLICKED, NULL);
             lv_obj_set_style_bg_color(btnCancel, lv_color_make(0x80, 0x00, 0x00), 0);
             lv_obj_t* lblCancel = lv_label_create(btnCancel);
@@ -642,6 +696,7 @@ void doWiFiScan() {
     
     lv_timer_handler();
     
+    Serial.println("[WiFi] Resetting WiFi module...");
     WiFi.disconnect(true);
     delay(100);
     WiFi.mode(WIFI_OFF);
@@ -650,11 +705,13 @@ void doWiFiScan() {
     delay(500);
     
     Serial.println("[WiFi] Starting scan...");
+    Serial.printf("[WiFi] WiFi mode: %s\n", WiFi.getMode() == WIFI_MODE_STA ? "STA" : "OTHER");
+    Serial.printf("[WiFi] Free heap: %u\n", ESP.getFreeHeap());
     
-    int n = WiFi.scanNetworks(false, true, false, 15000);
+    int n = WiFi.scanNetworks(false, true, false, 10000);
     
     unsigned long start = millis();
-    while (WiFi.scanComplete() == WIFI_SCAN_RUNNING && millis() - start < 20000) {
+    while (WiFi.scanComplete() == WIFI_SCAN_RUNNING && millis() - start < 15000) {
         delay(100);
     }
     
@@ -820,7 +877,7 @@ void file_browse_cb(lv_event_t *e) {
     lv_obj_set_style_bg_color(fileList, lv_color_make(0x20, 0x20, 0x20), 0);
     
     lv_obj_t* btnBack = lv_btn_create(appScreen);
-    lv_obj_set_size(btnBack, 80, 30);
+    lv_obj_set_size(btnBack, 80, 25);
     lv_obj_align(btnBack, LV_ALIGN_BOTTOM_LEFT, 10, -5);
     lv_obj_add_event_cb(btnBack, file_back_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_set_style_bg_color(btnBack, lv_color_make(0x40, 0x40, 0x80), 0);
@@ -884,7 +941,7 @@ void updateWifiConnection() {
         rgbLedSet(255, 0, 0);
     } else {
         wifiConnectAttempts++;
-        if (wifiConnectAttempts > 200) {
+        if (wifiConnectAttempts > 50) {
             wifiConnecting = false;
             wifiAppState = WIFI_MODE_FAILED;
             WiFi.disconnect();
@@ -917,6 +974,8 @@ void setup() {
     ledcAttachPin(BACKLIGHT_PIN, 0);
     bsp_backlight_set(BACKLIGHT_MAX);
     
+    Serial.printf("[BL] PWM initialized on GPIO %d\n", BACKLIGHT_PIN);
+    
     initTouch();
     initSDCard();
     
@@ -939,11 +998,7 @@ void setup() {
 }
 
 void loop() {
-    if (bootButtonPressed) {
-        bootButtonPressed = false;
-        cycleBacklightMode();
-        lastActivityMs = millis();
-    }
+    handleBootButton();
     
     if (currentApp == APP_SETTINGS) {
         updateWifiConnection();
